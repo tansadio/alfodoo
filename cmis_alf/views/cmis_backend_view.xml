@@ -14,7 +14,7 @@
             <group name="cmis_right" position="inside">
                 <field
                     name="alfresco_api_location"
-                    placeholder="e.g. http://localhost:8080/alfresco/s/api"
+                    placeholder="e.g. http://localhost:8080/alfresco/api/-default-/public/alfresco/versions/1"
                 />
             </group>
         </field>
