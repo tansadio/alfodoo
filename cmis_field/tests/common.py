@@ -1,6 +1,7 @@
 # Copyright 2016 ACSONE SA/NV (<http://acsone.eu>)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 from contextlib import contextmanager
+from types import MappingProxyType
 from unittest import mock
 
 from odoo_test_helper import FakeModelLoader
@@ -76,5 +77,18 @@ class BaseTestCmis(common.TransactionCase, FakeModelLoader):
 
     @classmethod
     def tearDownClass(cls):
+        original = cls.loader._original_registry
         cls.loader.restore_registry()
+        # With Odoo 19, model._fields is a read-only view of model._fields__
+        # and the fields are attributes of the model classes: restore_registry
+        # only replaces model._fields by a copy and removes the attributes, so
+        # the ORM would use other field objects. Restore them consistently.
+        for name, model in cls.env.registry.models.items():
+            fields_ = dict(original[name]["_fields"])
+            model._fields__.clear()
+            model._fields__.update(fields_)
+            model._fields = MappingProxyType(model._fields__)
+            for field_name, field in fields_.items():
+                if vars(model).get(field_name) is not field:
+                    setattr(model, field_name, field)
         super().tearDownClass()
