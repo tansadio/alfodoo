@@ -1,2 +1,2 @@
 odoo-test-helper
-odoo-addon-cmis @ git+https://github.com/OCA/connector-cmis.git@refs/pull/47/head#subdirectory=cmis
+odoo-addon-cmis @ git+https://github.com/tansadio/connector-cmis.git@19.0-mig-cmis#subdirectory=cmis
