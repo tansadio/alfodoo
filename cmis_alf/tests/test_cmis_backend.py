@@ -3,7 +3,7 @@
 
 from unittest import mock
 
-from odoo.tests import common
+from odoo.tests import common, new_test_user
 
 from odoo.addons.cmis.tests.common import FakeSession, make_response
 
@@ -30,6 +30,11 @@ class TestCmisBackendAlfresco(common.TransactionCase):
         )
         client = self.backend.get_alfresco_client()
         self.assertEqual(client.url, self.backend.alfresco_api_location)
+        self.assertEqual(client.session.auth, ("admin", "admin"))
+
+    def test_get_alfresco_client_as_user(self):
+        user = new_test_user(self.env, login="cmis_alf_user", groups="base.group_user")
+        client = self.backend.with_user(user).get_alfresco_client()
         self.assertEqual(client.session.auth, ("admin", "admin"))
 
     def test_cmis_objectid_from_noderef(self):

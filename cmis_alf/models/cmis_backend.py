@@ -24,11 +24,13 @@ class CmisBackend(models.Model):
     def get_alfresco_client(self):
         """Return a client for the Alfresco public REST API v1"""
         self.ensure_one()
+        # the credentials are only readable by the administrators
+        backend = self.sudo()
         return AlfrescoRestClient(
-            self.alfresco_api_location,
-            self.username,
-            self.password,
-            timeout=self.timeout or None,
+            backend.alfresco_api_location,
+            backend.username,
+            backend.password,
+            timeout=backend.timeout or None,
         )
 
     def _get_alf_noderef_from_objectid(self, cmis_objectid):
