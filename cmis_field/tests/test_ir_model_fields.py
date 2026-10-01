@@ -2,11 +2,14 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 from unittest import mock
 
+from odoo.tests import common
+
 from ..fields import CmisFolder
-from .common import BaseTestCmis
 
 
-class TestIrModelFields(BaseTestCmis):
+# run at install, before the post_install test classes that load and unload
+# the fake models (unloading them leaves stale ir.model.fields in the ORM)
+class TestIrModelFields(common.TransactionCase):
     def test_add_cmis_folder(self):
         """Test the addition of CmisFolder field to an existing model by
         using the functionality provided by ir_model_fields
@@ -20,6 +23,7 @@ class TestIrModelFields(BaseTestCmis):
             {
                 "ttype": CmisFolder.type,
                 "name": x_field,
+                "field_description": "CMIS Folder",
                 "model": "res.company",
                 "model_id": model_id,
             }

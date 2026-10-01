@@ -2,7 +2,7 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 import re
 
-from odoo import _, api, fields, models
+from odoo import api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
 CMIS_NAME_INVALID_CHARS = r'\/:*?"<>|'
@@ -10,7 +10,6 @@ CMIS_NAME_INVALID_CHARS_RX = "[" + re.escape(CMIS_NAME_INVALID_CHARS) + "]"
 
 
 class CmisBackend(models.Model):
-
     _inherit = "cmis.backend"
 
     @api.constrains("sanitize_replace_char")
@@ -19,8 +18,10 @@ class CmisBackend(models.Model):
             rc = rec.sanitize_replace_char
             if rc and re.findall(CMIS_NAME_INVALID_CHARS_RX, rc):
                 raise ValidationError(
-                    _("The character to use as replacement can not be one of" "'%s'")
-                    % CMIS_NAME_INVALID_CHARS
+                    self.env._(
+                        "The character to use as replacement can not be one of '%s'",
+                        CMIS_NAME_INVALID_CHARS,
+                    )
                 )
 
     enable_sanitize_cmis_name = fields.Boolean(
@@ -38,8 +39,8 @@ class CmisBackend(models.Model):
     )
     folder_name_conflict_handler = fields.Selection(
         selection=[
-            ("error", _("Raise exception")),
-            ("increment", _('Create as "name_(X)"')),
+            ("error", "Raise exception"),
+            ("increment", 'Create as "name_(X)"'),
         ],
         string="Strategy in case of duplicate",
         required=True,
@@ -72,12 +73,13 @@ class CmisBackend(models.Model):
         backend = self.search(domain)
         if len(backend) != 1 and raise_if_not_found:
             if name:
-                msg = _("Expected 1 backend named %(name)s, %(number)s found") % {
-                    "name": name,
-                    "number": len(backend),
-                }
+                msg = self.env._(
+                    "Expected 1 backend named %(name)s, %(number)s found",
+                    name=name,
+                    number=len(backend),
+                )
             else:
-                msg = _("No backend found")
+                msg = self.env._("No backend found")
             raise UserError(msg)
         return backend
 
@@ -92,12 +94,13 @@ class CmisBackend(models.Model):
             if not raise_if_invalid:
                 return False
             raise UserError(
-                _(
+                self.env._(
                     "%(name)s is not a valid name.\n"
-                    "The following chars are not allowed %(invalid_chars)s and"
-                    "the name can not ends with a space or a '.'"
+                    "The following chars are not allowed %(invalid_chars)s and "
+                    "the name can not ends with a space or a '.'",
+                    name=name,
+                    invalid_chars=CMIS_NAME_INVALID_CHARS,
                 )
-                % {"name": name, "invalid_chars": CMIS_NAME_INVALID_CHARS}
             )
         return True
 
@@ -138,38 +141,40 @@ class CmisBackend(models.Model):
          if backend.folder_name_conflict_handler == 'error'
             ValidationError is raised
          if backend.folder_name_conflict_handler == 'increment'
-            return a new name with suffix '_X'
+            return a new name with suffix '_(X)'
+        :param parent: the parent folder, as cmis:objectId or CmisObject
         :return: a unique name
         """
         self.ensure_one()
         conflict_handler = conflict_handler or self.folder_name_conflict_handler
+        parent_id = getattr(parent, "id", parent)
+        repo = self.get_cmis_repository()
+        quoted_name = name.replace("\\", "\\\\").replace("'", "\\'")
         cmis_qry = (
             "SELECT cmis:objectId FROM cmis:folder WHERE "
-            "IN_FOLDER('%s') AND cmis:name='%s'"
-            % (parent.getObjectId(), name.replace("'", "\\'"))
+            f"IN_FOLDER('{parent_id}') AND cmis:name='{quoted_name}'"
         )
-        rs = parent.repository.query(cmis_qry)
-        num_found_items = rs.getNumItems()
-        if num_found_items > 0:
-            if conflict_handler == "error":
-                raise ValidationError(_('Folder "%s" already exists in CMIS') % (name))
-            if conflict_handler == "increment":
-                testname = name + "_(%)"
-                cmis_qry = (
-                    "SELECT * FROM cmis:folder WHERE "
-                    "IN_FOLDER('%s') AND cmis:name like '%s'"
-                    % (parent.getObjectId(), testname.replace("'", "\\'"))
-                )
-                rs = parent.repository.query(cmis_qry)
-                names = [r.name for r in rs]
-                max_num = 0
-                if names:
-                    nums = []
-                    for n in names:
-                        num = re.findall(r"_\((\d+)\)", n)
-                        if num:
-                            nums.append(int(num[0]))
-                    if nums:
-                        max_num = max(nums)
-                return name + "_(%d)" % (max_num + 1)
-        return name
+        if not repo.query(cmis_qry, max_items=1).objects:
+            return name
+        if conflict_handler == "error":
+            raise ValidationError(
+                self.env._('Folder "%s" already exists in CMIS', name)
+            )
+        # increment: find the highest suffix already used
+        cmis_qry = (
+            "SELECT cmis:name FROM cmis:folder WHERE "
+            f"IN_FOLDER('{parent_id}') AND "
+            f"cmis:name LIKE '{self.sanitize_input(name)}\\_(%)'"
+        )
+        nums = [0]
+        skip_count = 0
+        while True:
+            page = repo.query(cmis_qry, skip_count=skip_count)
+            for folder in page.objects:
+                num = re.findall(r"_\((\d+)\)$", folder.name or "")
+                if num:
+                    nums.append(int(num[0]))
+            if not page.has_more_items or not page.objects:
+                break
+            skip_count += len(page.objects)
+        return f"{name}_({max(nums) + 1})"

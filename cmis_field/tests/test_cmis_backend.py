@@ -7,10 +7,12 @@ from unittest import mock
 from odoo.exceptions import UserError, ValidationError
 from odoo.tests import common
 
+from odoo.addons.cmis.client import CmisPage
+
 
 class TestCmisBackend(common.TransactionCase):
     def setUp(self):
-        super(TestCmisBackend, self).setUp()
+        super().setUp()
         self.cmis_backend = self.env["cmis.backend"]
         self.backend_instance = self.env.ref("cmis.cmis_backend_alfresco")
 
@@ -57,93 +59,66 @@ class TestCmisBackend(common.TransactionCase):
         )
         self.assertEqual(sanitized, ["y dir", "sub dir"])
 
+    @staticmethod
+    def _folder(name):
+        folder = mock.MagicMock()
+        folder.name = name
+        return folder
+
+    def _mock_query(self, *pages):
+        """Patch the repository to answer the queries with the given pages
+        of folder names"""
+        repository = mock.MagicMock()
+        repository.query.side_effect = [
+            CmisPage([self._folder(name) for name in names], False, len(names))
+            for names in pages
+        ]
+        patcher = mock.patch.object(
+            type(self.backend_instance), "get_cmis_repository", return_value=repository
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return repository
+
     def test_get_unique_folder_name(self):
-        mocked_parent = mock.MagicMock()
         # if no name found, the method return the same name
-        repository = mock.MagicMock()
-        mocked_parent.repository = repository
-        query_result = mock.MagicMock()
-        repository.query.side_effect = lambda *a: query_result
-        query_result.getNumItems.side_effect = lambda *a: 0
+        self._mock_query([])
         self.assertEqual(
-            "test", self.backend_instance.get_unique_folder_name("test", mocked_parent)
+            "test", self.backend_instance.get_unique_folder_name("test", "parent_id")
         )
+
+    def test_get_unique_folder_name_error(self):
         # if the same name is found and the folder_name_conflict_handler ==
         # 'error' a ValidationError is raised
-        query_result.getNumItems.side_effect = lambda *a: 1
+        self._mock_query(["test"])
         self.backend_instance.folder_name_conflict_handler = "error"
         with self.assertRaises(ValidationError):
-            self.backend_instance.get_unique_folder_name("test", mocked_parent)
+            self.backend_instance.get_unique_folder_name("test", "parent_id")
 
-        self.cpt = 0
-
-        def query(q):
-            if self.cpt == 0:
-                self.cpt += 1
-                query_result.getNumItems.side_effect = lambda *a: 1
-                return query_result
-            if self.cpt == 1:
-                test = mock.Mock()
-                test.configure_mock()
-                ret = []
-                for v in ["test_(backup)", "test_(1)", "test_(3)"]:
-                    m = mock.Mock()
-                    m.configure_mock(name=v)
-                    ret.append(m)
-                query_result.__iter__.return_value = ret
-                return query_result
-            return None  # pragma: no cover
-
+    def test_get_unique_folder_name_increment(self):
         # if the same name is found and the folder_name_conflict_handler ==
         # 'increment' the method must return a new name with a suffix _(X)
         # where X is the value max found as X for the same name + 1
+        repository = self._mock_query(
+            ["test"], ["test_(backup)", "test_(1)", "test_(3)"]
+        )
         self.backend_instance.folder_name_conflict_handler = "increment"
-        repository.query.side_effect = query
-        name = self.backend_instance.get_unique_folder_name("test", mocked_parent)
+        parent = mock.MagicMock(id="parent_id")
+        name = self.backend_instance.get_unique_folder_name("test", parent)
         self.assertEqual("test_(4)", name)
+        query = repository.query.call_args_list[1][0][0]
+        self.assertIn("IN_FOLDER('parent_id')", query)
+        self.assertIn("cmis:name LIKE 'test\\_(%)'", query)
 
-    def test_get_unique_folder_name_2(self):
-        mocked_parent = mock.MagicMock()
-        # if no name found, the method return the same name
-        repository = mock.MagicMock()
-        mocked_parent.repository = repository
-        query_result = mock.MagicMock()
-        repository.query.side_effect = lambda *a: query_result
-        query_result.getNumItems.side_effect = lambda *a: 0
-        self.assertEqual(
-            "test", self.backend_instance.get_unique_folder_name("test", mocked_parent)
-        )
-        # if the same name is found and the folder_name_conflict_handler ==
-        # 'error' a ValidationError is raised
-        query_result.getNumItems.side_effect = lambda *a: 1
-        self.backend_instance.folder_name_conflict_handler = "error"
-        with self.assertRaises(ValidationError):
-            self.backend_instance.get_unique_folder_name("test", mocked_parent)
-
-        self.cpt = 0
-
+    def test_get_unique_folder_name_increment_first(self):
         # in this case a name is found put without increment
-        def query(q):
-            if self.cpt == 0:
-                self.cpt += 1
-                query_result.getNumItems.side_effect = lambda *a: 1
-                return query_result
-            if self.cpt == 1:
-                test = mock.Mock()
-                test.configure_mock()
-                ret = []
-                for v in ["test_(backup)"]:
-                    m = mock.Mock()
-                    m.configure_mock(name=v)
-                    ret.append(m)
-                query_result.__iter__.return_value = ret
-                return query_result
-            return None  # pragma: no cover
-
-        # if no name is found and the folder_name_conflict_handler ==
-        # 'increment' the method must return a new name with a suffix _(X)
-        # where X is the value max found as X for the same name + 1
+        self._mock_query(["test"], ["test_(backup)"])
         self.backend_instance.folder_name_conflict_handler = "increment"
-        repository.query.side_effect = query
-        name = self.backend_instance.get_unique_folder_name("test", mocked_parent)
+        name = self.backend_instance.get_unique_folder_name("test", "parent_id")
         self.assertEqual("test_(1)", name)
+
+    def test_get_unique_folder_name_quote(self):
+        repository = self._mock_query([])
+        self.backend_instance.get_unique_folder_name("l'été", "parent_id")
+        query = repository.query.call_args[0][0]
+        self.assertIn("cmis:name='l\\'été'", query)

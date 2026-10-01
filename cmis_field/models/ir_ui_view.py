@@ -4,13 +4,13 @@
 from odoo import api, models
 
 
-class Base(models.AbstractModel):
-
-    _inherit = "base"
+class IrUiView(models.Model):
+    _inherit = "ir.ui.view"
 
     @api.model
     def _get_view_field_attributes(self):
         keys = super()._get_view_field_attributes()
         keys.append("backend")
         keys.append("allow_create")
+        keys.append("allow_delete")
         return keys

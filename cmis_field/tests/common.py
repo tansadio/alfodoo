@@ -1,12 +1,34 @@
 # Copyright 2016 ACSONE SA/NV (<http://acsone.eu>)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
+from contextlib import contextmanager
 from unittest import mock
 
 from odoo_test_helper import FakeModelLoader
 
-from odoo.tests import common
+from odoo.tests import common, tagged
 
 
+def cmis_object(object_id):
+    """Return a mock of odoo.addons.cmis.client.CmisObject"""
+    return mock.MagicMock(id=object_id)
+
+
+@contextmanager
+def mocked_cmis_repository():
+    """Patch the CMIS repository of the backends. By default, the parent
+    folder is found by path (``root_id``) and new folders get ``cmis_id``"""
+    with mock.patch(
+        "odoo.addons.cmis.models.cmis_backend.CmisBackend.get_cmis_repository"
+    ) as mocked_get_repository:
+        repository = mock.MagicMock()
+        mocked_get_repository.return_value = repository
+        repository.get_object_by_path.return_value = cmis_object("root_id")
+        repository.create_folder.return_value = cmis_object("cmis_id")
+        yield repository
+
+
+# the fake models change the registry: run once all the modules are loaded
+@tagged("post_install", "-at_install")
 class BaseTestCmis(common.TransactionCase, FakeModelLoader):
     @classmethod
     def setUpClass(cls):
@@ -19,6 +41,9 @@ class BaseTestCmis(common.TransactionCase, FakeModelLoader):
         cls.loader.update_registry(
             (CmisTestModel, CmisTestModelInherits, CmisTestModelRelated)
         )
+        # compute the fields of the ir.model.fields created for the fake
+        # models now: they no longer exist once the test class rolled back
+        cls.env.flush_all()
 
         # mock commit since it"s called in the _auto_init method
         cls.cr.commit = mock.MagicMock()
@@ -29,7 +54,7 @@ class BaseTestCmis(common.TransactionCase, FakeModelLoader):
         cls.cmis_backend.initial_directory_write = "/odoo"
 
     def setUp(self):
-        super(BaseTestCmis, self).setUp()
+        super().setUp()
 
         # global patch
 
@@ -42,6 +67,7 @@ class BaseTestCmis(common.TransactionCase, FakeModelLoader):
             side_effect=get_unique_folder_name,
         )
         self.patched_get_unique_folder_name.start()
+        self.addCleanup(self.patched_get_unique_folder_name.stop)
         # We are replacing get_unique_folder_name by a mock. If Odoo asks
         # whether a method as _ondelete attr, the answer is always yes.
         # But there is no ondelete method on cmis_backend so we force it

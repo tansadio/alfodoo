@@ -3,7 +3,7 @@
 
 {
     "name": "Alfodoo CMIS Field",
-    "version": "16.0.1.0.0",
+    "version": "19.0.1.0.0",
     "summary": "Specialized field to work with a CMIS server",
     "category": "Document Management",
     "author": "ACSONE SA/NV ",
@@ -11,13 +11,7 @@
     "license": "AGPL-3",
     "depends": ["cmis"],
     "data": ["views/cmis_backend_view.xml"],
-    "installable": False,
     "images": [
         "static/description/main_icon.png",
     ],
-    "external_dependencies": {
-        "python": [
-            "cmislib",  # >= 0.7.0
-        ]
-    },
 }

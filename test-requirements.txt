@@ -1,2 +1,3 @@
-odoo-test-helper
+# Odoo 19 support, see https://github.com/OCA/odoo-test-helper/pull/47
+odoo-test-helper @ git+https://github.com/acsone/odoo-test-helper.git@fix-compatibility-with-odoo-19
 odoo-addon-cmis @ git+https://github.com/tansadio/connector-cmis.git@19.0-mig-cmis#subdirectory=cmis

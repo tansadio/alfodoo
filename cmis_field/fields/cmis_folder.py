@@ -1,22 +1,26 @@
 # Copyright 2016 ACSONE SA/NV (<http://acsone.eu>)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 import logging
-import threading
 import time
 from functools import partial
 from operator import attrgetter
 
-from cmislib.exceptions import ObjectNotFoundException
-
-from odoo import SUPERUSER_ID, _, api, fields, registry
+from odoo import SUPERUSER_ID, api, fields
 from odoo.exceptions import UserError
-from odoo.tools.sql import pg_varchar
+from odoo.modules import module
+from odoo.modules.registry import Registry
+
+from odoo.addons.cmis.client import CmisObject
+from odoo.addons.cmis.exceptions import CMISObjectNotFoundError
 
 _logger = logging.getLogger(__name__)
 
 
-class CmisFolder(fields.Field):
+class CmisFolder(fields.Char):
     """A reference to a cmis:folder. (cmis:objectId)
+
+    The value is stored as a ``varchar``, like a ``Char`` field, and is the
+    ``cmis:objectId`` of the folder in the CMIS repository.
 
     :param backend_name:
 
@@ -48,7 +52,7 @@ class CmisFolder(fields.Field):
     :param create_name_get: name of a method that return the name of the
         folder to create into the CMIS repository. The method is called with
         the field definition instance and the bakend as paramaters.
-        (optional: by default instance.name_get)
+        (optional: by default the display_name of the records)
     :rtype: dict
     :return: a dictionay with an entry for each record of the invoked
         recordset with the following structure ::
@@ -68,19 +72,18 @@ class CmisFolder(fields.Field):
     """
 
     type = "cmis_folder"
-    column_type = ("varchar", pg_varchar())
     backend_name = None
     create_method = None
-    create_name_get = "name_get"
+    create_name_get = "display_name"
     create_parent_get = None
     create_properties_get = None
     allow_create = True
     allow_delete = False
     copy = False  # noderef are not copied by default
+    trim = False
 
-    def __init__(self, **kwargs):
-        self.backend_name = kwargs.get("backend_name")
-        super().__init__(**kwargs)
+    # related and inherited fields use the backend of their target field
+    _related_backend_name = property(attrgetter("backend_name"))
 
     def _is_registry_loading_mode(self, env):
         """
@@ -89,13 +92,7 @@ class CmisFolder(fields.Field):
         return env.context.get("install_mode")
 
     def _description_backend(self, env):
-        if self.inherited:
-            # In the case of a cmis field inherited from another module
-            # the attribute backend_name is not inherited so we have to
-            # get it on the original fiel
-            backend = self.inherited_field.get_backend(env, raise_if_not_found=False)
-        else:
-            backend = self.get_backend(env, raise_if_not_found=False)
+        backend = self.get_backend(env, raise_if_not_found=False)
         if len(backend) > 1:
             if self._is_registry_loading_mode(env):
                 # While the registry is loading, specific attributes are not available
@@ -105,16 +102,16 @@ class CmisFolder(fields.Field):
                 # into the list.
                 backend = backend[:1]
             else:
-                msg = _("Too many backend found. " "Please check your configuration.")
+                msg = env._("Too many backend found. Please check your configuration.")
                 return {"backend_error": msg}
         if not backend:
             if self.backend_name:
-                msg = (
-                    _("Backend named %s not found. " "Please check your configuration.")
-                    % self.backend_name
+                msg = env._(
+                    "Backend named %s not found. Please check your configuration.",
+                    self.backend_name,
                 )
             else:
-                msg = _("No backend found. Please check your configuration.")
+                msg = env._("No backend found. Please check your configuration.")
             return {"backend_error": msg}
         return backend.get_web_description()[backend.id]
 
@@ -147,13 +144,10 @@ class CmisFolder(fields.Field):
 
     def _create_value_related(self, records):
         others = records.sudo() if self.compute_sudo else records
-        for record, other in zip(records, others):
-            if not record.id and record.env != other.env:
-                # draft records: copy record's cache to other's cache first
-                fields.copy_cache(record, other.env)
-            other, field = self.traverse_related(other)
-            field.create_value(other)
-            record[self.name] = other[field.name]
+        for other in others:
+            target, field = self.traverse_related(other)
+            field.create_value(target)
+        records.invalidate_recordset([self.name])
 
     def _create_in_cmis(self, records, backend):
         names = self.get_create_names(records, backend)
@@ -167,43 +161,45 @@ class CmisFolder(fields.Field):
             else:
                 backend.is_valid_cmis_name(name, raise_if_invalid=True)
             parent = parents[record.id]
-            name = backend.get_unique_folder_name(name, parent)
+            parent_id = parent.id if isinstance(parent, CmisObject) else parent
+            name = backend.get_unique_folder_name(name, parent_id)
             props = properties[record.id] or {}
-            value = repo.createFolder(parent, name, props)
-
-            def clean_up_folder(cmis_object_id, backend_id, dbname):
-                db_registry = registry(dbname)
-                with db_registry.cursor() as cr:
-                    env = api.Environment(cr, SUPERUSER_ID, {})
-                    backend = env["cmis.backend"].browse(backend_id)
-                    _repo = backend.get_cmis_repository()
-                    # The rollback is delayed by an arbitrary length of time to give
-                    # the GED time to create the folder. If the folder is not properly
-                    # created at the time the rollback executes, it cannot be deleted.
-                    time.sleep(0.5)
-                    try:
-                        _repo.getObject(cmis_object_id).deleteTree()
-                    except ObjectNotFoundException:
-                        _logger.info("Cannot clean up folder: ObjectNotFoundException")
+            value = repo.create_folder(parent_id, name, props)
 
             # remove created resource in case of rollback
-            test_mode = getattr(threading.current_thread(), "testing", False)
-            if not test_mode:
+            if not module.current_test:
                 record.env.cr.postrollback.add(
                     partial(
-                        clean_up_folder,
-                        value.getObjectId(),
+                        self._clean_up_folder,
+                        value.id,
                         backend.id,
                         record.env.cr.dbname,
                     ),
                 )
 
-            self.__set__(record, value.getObjectId())
+            self.__set__(record, value.id)
+
+    @staticmethod
+    def _clean_up_folder(cmis_object_id, backend_id, dbname):
+        with Registry(dbname).cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            backend = env["cmis.backend"].browse(backend_id)
+            repo = backend.get_cmis_repository()
+            # The rollback is delayed by an arbitrary length of time to give
+            # the GED time to create the folder. If the folder is not properly
+            # created at the time the rollback executes, it cannot be deleted.
+            time.sleep(0.5)
+            try:
+                repo.get_object(cmis_object_id).delete_tree()
+            except CMISObjectNotFoundError:
+                _logger.info("Cannot clean up folder %s: not found", cmis_object_id)
 
     def _check_null(self, record, raise_exception=True):
         val = self.__get__(record, record)
         if val and raise_exception:
-            raise UserError(_("A value is already assigned to %s") % self)
+            raise UserError(
+                record.env._("A value is already assigned to %s", self.string)
+            )
         return val
 
     def get_create_names(self, records, backend):
@@ -216,8 +212,8 @@ class CmisFolder(fields.Field):
             {record.id: 'name'}
 
         """
-        if self.create_name_get == "name_get":
-            return dict(records.name_get())
+        if self.create_name_get in ("display_name", "name_get"):
+            return {record.id: record.display_name for record in records}
         fct = self.create_name_get
         if not callable(fct):
             fct = getattr(records, fct)
@@ -242,7 +238,7 @@ class CmisFolder(fields.Field):
         parent_cmis_object = backend.get_folder_by_path_parts(
             path_parts, create_if_not_found=True
         )
-        return dict.fromkeys(records.ids, parent_cmis_object)
+        return dict.fromkeys(records.ids, parent_cmis_object.id)
 
     def get_create_properties(self, records, backend):
         """Return the properties to use to created the folder into the CMIS
@@ -271,10 +267,9 @@ class CmisFolder(fields.Field):
         return path_parts
 
     def get_cmis_object(self, record):
-        """Returns an instance of
-        :class:`cmislib.browser.binding.BrowserFolder`
-        This instance is a proxy object that can be used to perform action on
-        the folder into the cmis container
+        """Returns the :class:`odoo.addons.cmis.client.CmisObject` of the
+        folder, that can be used to perform actions on the folder into the
+        cmis container
         :param record:
         """
         val = self.__get__(record, record)
@@ -282,4 +277,4 @@ class CmisFolder(fields.Field):
             return None
         backend = self.get_backend(record.env)
         repo = backend.get_cmis_repository()
-        return repo.getObject(val)
+        return repo.get_object(val)
