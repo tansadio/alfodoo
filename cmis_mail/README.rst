@@ -22,6 +22,7 @@ Contributors
 ------------
 
 * Thomas Binsfeld <thomas.binsfeld@acsone.eu>
+* tansadio <tansadio@gmail.com>
 
 Maintainer
 ----------

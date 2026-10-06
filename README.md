@@ -23,6 +23,7 @@ addon | version | maintainers | summary
 --- | --- | --- | ---
 [cmis_alf](cmis_alf/) | 19.0.1.0.0 |  | Alfresco extension for the CMIS Connector
 [cmis_field](cmis_field/) | 19.0.1.0.0 |  | Specialized field to work with a CMIS server
+[cmis_mail](cmis_mail/) | 19.0.1.0.0 |  | Store the attachments of the mail composer in CMIS
 [cmis_report_write](cmis_report_write/) | 19.0.1.0.0 |  | Save your report into a CMIS container
 
 [//]: # (end addons)

@@ -1,13 +1,12 @@
 # Copyright 2022 ACSONE SA/NV
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
-import base64
 import logging
 import mimetypes
 import os
-from io import BytesIO
+import re
 
-from odoo import _, api, fields, models
+from odoo import api, fields, models
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
@@ -22,15 +21,18 @@ class MailComposeMessage(models.TransientModel):
     )
     allowed_cmis_folder_field_ids = fields.Many2many(
         comodel_name="ir.model.fields",
-        readonly=True,
+        compute="_compute_cmis_folder_fields",
     )
     is_multiple_cmis_fields = fields.Boolean(
-        readonly=True,
+        compute="_compute_cmis_folder_fields",
     )
     cmis_folder_field_id = fields.Many2one(
         string="CMIS Folder",
         comodel_name="ir.model.fields",
-        domain="[('id', 'in', allowed_cmis_folder_field_ids.ids)]",
+        domain="[('id', 'in', allowed_cmis_folder_field_ids)]",
+        compute="_compute_cmis_folder_field_id",
+        store=True,
+        readonly=False,
     )
     cmis_duplicate_handler = fields.Selection(
         selection=[
@@ -43,38 +45,33 @@ class MailComposeMessage(models.TransientModel):
         default="increment",
     )
 
-    @api.model
-    def default_get(self, fields):  # pylint:disable=redefined-outer-name
-        res = super().default_get(fields)
-        related_model = res.get("model")
-        if not related_model:
-            return res
-        cmis_fields = (
-            self.env["ir.model.fields"]
-            .sudo()
-            .search([("model", "=", related_model), ("ttype", "=", "cmis_folder")])
-        )
-        if cmis_fields:
-            res.update(
-                {
-                    "allowed_cmis_folder_field_ids": [(6, 0, cmis_fields.ids)],
-                    "cmis_folder_field_id": cmis_fields[0].id,
-                    "is_multiple_cmis_fields": len(cmis_fields) > 1,
-                }
-            )
-        return res
+    @api.depends("model")
+    def _compute_cmis_folder_fields(self):
+        for rec in self:
+            cmis_fields = self.env["ir.model.fields"]
+            if rec.model:
+                cmis_fields = cmis_fields.sudo().search(
+                    [("model", "=", rec.model), ("ttype", "=", "cmis_folder")]
+                )
+            rec.allowed_cmis_folder_field_ids = cmis_fields
+            rec.is_multiple_cmis_fields = len(cmis_fields) > 1
 
-    def _get_cmis_parent_folder(self):
+    @api.depends("allowed_cmis_folder_field_ids")
+    def _compute_cmis_folder_field_id(self):
+        for rec in self:
+            if rec.cmis_folder_field_id not in rec.allowed_cmis_folder_field_ids:
+                rec.cmis_folder_field_id = rec.allowed_cmis_folder_field_ids[:1]
+
+    def _get_cmis_parent_folder(self, related_record):
         self.ensure_one()
         field_name = self.cmis_folder_field_id.sudo().name
-        related_record = self.env[self.model].browse(self.res_id)
         field = related_record._fields[field_name]
         cmis_backend = field.get_backend(self.env)
         root_objectId = related_record[field_name]
         if not root_objectId:
             field.create_value(related_record)
             root_objectId = related_record[field_name]
-        return cmis_backend.get_cmis_repository().getObject(root_objectId)
+        return cmis_backend.get_cmis_repository().get_object(root_objectId)
 
     @api.model
     def get_mimetype(self, file_name):
@@ -82,83 +79,103 @@ class MailComposeMessage(models.TransientModel):
 
     @api.model
     def _sanitize_query_arg(self, arg):
-        return arg.replace("'", r"\'")
+        return arg.replace("\\", "\\\\").replace("'", "\\'")
 
     def _cmis_document_exists(self, cmis_parent_folder, file_name):
-        qfile_name = self._sanitize_query_arg(file_name)
+        """Return the document named file_name in the folder, or None"""
         cmis_qry = (
             "SELECT cmis:objectId FROM cmis:document WHERE "
-            "IN_FOLDER('%s') AND cmis:name='%s'"
-            % (cmis_parent_folder.getObjectId(), qfile_name)
+            f"IN_FOLDER('{cmis_parent_folder.id}') AND "
+            f"cmis:name='{self._sanitize_query_arg(file_name)}'"
         )
         _logger.debug("Query CMIS with %s", cmis_qry)
-        rs = cmis_parent_folder.repository.query(cmis_qry)
-        num_found_items = rs.getNumItems()
-        return num_found_items > 0, rs
+        repo = cmis_parent_folder.repository
+        page = repo.query(cmis_qry, max_items=1)
+        if not page.objects:
+            return None
+        return repo.get_object(page.objects[0].id)
 
-    def _save_attachments_in_cmis(self):
+    def _get_incremented_name(self, cmis_parent_folder, file_name):
+        """Return file_name suffixed by (X), X being the highest suffix
+        already used in the folder plus 1: file(1).pdf, file(2).pdf..."""
+        name, ext = os.path.splitext(file_name)
+
+        def like(value):
+            return (
+                self._sanitize_query_arg(value).replace("%", "\\%").replace("_", "\\_")
+            )
+
+        cmis_qry = (
+            "SELECT cmis:name FROM cmis:document WHERE "
+            f"IN_FOLDER('{cmis_parent_folder.id}') AND "
+            f"cmis:name LIKE '{like(name)}(%){like(ext)}'"
+        )
+        pattern = re.compile(re.escape(name) + r"\((\d+)\)" + re.escape(ext) + "$")
+        nums = [0]
+        for doc in cmis_parent_folder.repository.query(cmis_qry).objects:
+            match = pattern.match(doc.name or "")
+            if match:
+                nums.append(int(match.group(1)))
+        return f"{name}({max(nums) + 1}){ext}"
+
+    def _save_attachments_in_cmis(self, related_record):
         self.ensure_one()
-        if not self.model or not self.res_id:
-            return
-        cmis_parent_folder = self._get_cmis_parent_folder()
+        cmis_parent_folder = self._get_cmis_parent_folder(related_record)
         for attachment in self.attachment_ids:
             file_name = attachment.name
-            buffer = BytesIO(base64.b64decode(attachment.datas))
-            cmis_document_exists, rs = self._cmis_document_exists(
-                cmis_parent_folder, file_name
-            )
-            if not cmis_document_exists or self.cmis_duplicate_handler == "increment":
-                if cmis_document_exists:
-                    name, ext = os.path.splitext(file_name)
-                    testname = name + "(*)" + ext
-                    rs = cmis_parent_folder.getChildren(
-                        filter="cmis:name=%s" % testname
+            content = attachment.raw
+            existing = self._cmis_document_exists(cmis_parent_folder, file_name)
+            if existing and self.cmis_duplicate_handler == "error":
+                raise UserError(
+                    self.env._('Document "%s" already exists in CMIS', file_name)
+                )
+            if not existing or self.cmis_duplicate_handler == "increment":
+                if existing:
+                    file_name = self._get_incremented_name(
+                        cmis_parent_folder, file_name
                     )
-                    file_name = name + "(%d)" % rs.getNumItems() + ext
-                self._create_cmis_document(
-                    buffer,
-                    file_name,
-                    cmis_parent_folder,
-                )
-            if cmis_document_exists and self.cmis_duplicate_handler == "new_version":
-                doc = cmis_parent_folder.repository.getObject(
-                    rs.getResults()[0].getObjectId()
-                )
-                self._update_cmis_document(buffer, file_name, doc)
-            if self.cmis_duplicate_handler == "error":
-                raise UserError(_('Document "%s" already exists in CMIS') % (file_name))
+                self._create_cmis_document(content, file_name, cmis_parent_folder)
+            elif self.cmis_duplicate_handler == "new_version":
+                self._update_cmis_document(content, file_name, existing)
+            # use_existing: the existing document is kept
 
-    def _create_cmis_document(self, buffer, file_name, cmis_parent_folder):
+    def _create_cmis_document(self, content, file_name, cmis_parent_folder):
         self.ensure_one()
         props = {
             "cmis:name": file_name,
         }
         mimetype = self.get_mimetype(file_name)
-        return cmis_parent_folder.createDocument(
+        return cmis_parent_folder.create_document(
             file_name,
+            content,
+            mimetype,
             properties=props,
-            contentFile=buffer,
-            contentType=mimetype,
         )
 
-    def _update_cmis_document(self, buffer, file_name, cmis_doc):
+    def _update_cmis_document(self, content, file_name, cmis_doc):
         self.ensure_one()
-        props = {
-            "cmis:name": file_name,
-        }
         mimetype = self.get_mimetype(file_name)
-        cmis_doc = cmis_doc.checkout()
-        return cmis_doc.checkin(
-            checkinComment=_("Saved from Odoo mail composer"),
-            contentFile=buffer,
-            contentType=mimetype,
+        pwc = cmis_doc.check_out()
+        return cmis_doc.repository.check_in(
+            pwc.id,
+            content,
+            mimetype,
             major=False,
-            properties=props,
+            comment=self.env._("Saved from Odoo mail composer"),
+            filename=file_name,
         )
 
     def _action_send_mail(self, auto_commit=False):
         res = super()._action_send_mail(auto_commit=auto_commit)
         for rec in self:
-            if rec.is_save_in_cmis_enabled:
-                rec._save_attachments_in_cmis()
+            if (
+                rec.is_save_in_cmis_enabled
+                and rec.cmis_folder_field_id
+                and rec.model
+                and rec.composition_mode == "comment"
+            ):
+                for related_record in self.env[rec.model].browse(
+                    rec._evaluate_res_ids()
+                ):
+                    rec._save_attachments_in_cmis(related_record)
         return res
