@@ -8,10 +8,11 @@ from unittest import mock
 from odoo.exceptions import UserError, ValidationError
 from odoo.tools import mute_logger
 
+from odoo.addons.cmis.client import CmisPage
 from odoo.addons.cmis_field.tests import common
 
 
-class TestIrActionsReport(common.BaseTestCmis):
+class CmisReportCase(common.BaseTestCmis):
     @classmethod
     def create_sample_report(cls):
         cls.cmis_folder_field_id = cls.env["ir.model.fields"].search(
@@ -74,6 +75,8 @@ class TestIrActionsReport(common.BaseTestCmis):
             merge_pdfs_patcher.stop()
             get_wkhtmltopdf_state_patcher.stop()
 
+
+class TestIrActionsReport(CmisReportCase):
     def test_constrains(self):
         action_report = self.env["ir.actions.report"]
         with self.assertRaises(ValidationError):
@@ -130,8 +133,17 @@ class TestIrActionsReport(common.BaseTestCmis):
             self.action_report._render(self.report, self.inst.ids)
             # check that the method is called
             self.assertEqual(mocked_save.call_count, 1)
-            record, bugger = mocked_save.call_args[0]
+            record, buffer = mocked_save.call_args[0]
             self.assertEqual(self.inst, record)
+            self.assertEqual(buffer.getvalue(), self.pdf_content_1)
+        # the report is restored, no attachment is created
+        self.assertFalse(self.report.attachment)
+        self.assertFalse(self.report.attachment_use)
+        self.assertFalse(
+            self.env["ir.attachment"].search(
+                [("res_model", "=", "cmis.test.model"), ("res_id", "=", self.inst.id)]
+            )
+        )
 
     @mute_logger("odoo.addons.base.models.assetsbundle")
     def test_conditional_save(self):
@@ -147,108 +159,126 @@ class TestIrActionsReport(common.BaseTestCmis):
             # check that the method is called
             self.assertEqual(mocked_save.call_count, 0)
 
+    def _mock_cmis(self, existing=None, numbered=()):
+        """Mock the CMIS parent folder of the reports: ``existing`` is the
+        document found with the same name, ``numbered`` the names returned by
+        the query of the documents named name(X).ext"""
+        parent = mock.MagicMock(id="parent_id")
+        parent.repository.query.return_value = CmisPage(
+            [mock.MagicMock(**{"name": n}) for n in numbered], False, len(numbered)
+        )
+        for obj, name in zip(
+            parent.repository.query.return_value.objects, numbered, strict=True
+        ):
+            obj.name = name
+        patchers = [
+            mock.patch.object(
+                self.report.__class__, "_get_cmis_parent_folder", return_value=parent
+            ),
+            mock.patch.object(
+                self.report.__class__, "_search_cmis_document", return_value=existing
+            ),
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return parent
+
     @mute_logger("odoo.addons.base.models.assetsbundle")
     def test_duplicate_handle_error(self):
         self.report.cmis_duplicate_handler = "error"
         with mock.patch.object(
-            self.report.__class__, "_get_cmis_parent_folder"
-        ) as mocked_cmis_parent, mock.patch.object(
             self.report.__class__, "_create_cmis_document"
-        ) as mocked_create, self.env.cr.savepoint():
-            m = mock.MagicMock()
-            mocked_cmis_parent.return_value = m
-            rp = mock.MagicMock()
-            m.repository = rp
-            rs = mock.MagicMock()
-            rp.query.return_value = rs
-            rs.getNumItems.return_value = 0
-            # test the call the the create method inside our custom parser
-            self.action_report._render(self.report, self.inst.ids)
+        ) as mocked_create:
+            self._mock_cmis(existing=None)
             # the first call must succeed
+            self.action_report._render(self.report, self.inst.ids)
             self.assertEqual(mocked_create.call_count, 1)
-
-            with self.assertRaises(UserError):
-                # a second call must fails
-                rs.getNumItems.return_value = 1
-                self.action_report._render(self.report, self.inst.ids)
+        with (
+            mock.patch.object(
+                self.report.__class__,
+                "_search_cmis_document",
+                return_value=mock.MagicMock(),
+            ),
+            self.assertRaises(UserError),
+        ):
+            # a second call must fails
+            self.action_report._render(self.report, self.inst.ids)
 
     @mute_logger("odoo.addons.base.models.assetsbundle")
     def test_duplicate_handle_new_version(self):
         self.report.cmis_duplicate_handler = "new_version"
-        with mock.patch.object(
-            self.report.__class__, "_get_cmis_parent_folder"
-        ) as mocked_cmis_parent, mock.patch.object(
-            self.report.__class__, "_create_cmis_document"
-        ) as mocked_create, mock.patch.object(
-            self.report.__class__, "_update_cmis_document"
-        ) as mocked_update, self.env.cr.savepoint():
-            m = mock.MagicMock()
-            mocked_cmis_parent.return_value = m
-            rp = mock.MagicMock()
-            m.repository = rp
-            rs = mock.MagicMock()
-            rp.query.return_value = rs
-            rs.getNumItems.return_value = 1
-            # test the call the the create method inside our custom parser
+        existing = mock.MagicMock()
+        self._mock_cmis(existing=existing)
+        with (
+            mock.patch.object(
+                self.report.__class__, "_create_cmis_document"
+            ) as mocked_create,
+            mock.patch.object(
+                self.report.__class__, "_update_cmis_document"
+            ) as mocked_update,
+        ):
             self.action_report._render(self.report, self.inst.ids)
-            # the first call must succeed
             self.assertEqual(mocked_create.call_count, 0)
             self.assertEqual(mocked_update.call_count, 1)
+            self.assertIs(mocked_update.call_args[0][3], existing)
 
     @mute_logger("odoo.addons.base.models.assetsbundle")
     def test_duplicate_handle_increment(self):
         self.report.cmis_duplicate_handler = "increment"
+        parent = self._mock_cmis(
+            existing=mock.MagicMock(),
+            numbered=("folder_name(1).pdf", "folder_name(backup).pdf"),
+        )
         with mock.patch.object(
-            self.report.__class__, "_get_cmis_parent_folder"
-        ) as mocked_cmis_parent, mock.patch.object(
             self.report.__class__, "_create_cmis_document"
-        ) as mocked_create, self.env.cr.savepoint():
-            cmis_parent_folder = mock.MagicMock()
-            mocked_cmis_parent.return_value = cmis_parent_folder
-            rp = mock.MagicMock()
-            cmis_parent_folder.repository = rp
-            rs = mock.MagicMock()
-            rp.query.return_value = rs
-            rs.getNumItems.return_value = 1
-            rs = mock.MagicMock()
-            cmis_parent_folder.getChildren.return_value = rs
-            rs.getNumItems.return_value = 1
-            # test the call the the create method inside our custom parser
+        ) as mocked_create:
             self.action_report._render(self.report, self.inst.ids)
-            # the first call must succeed
             self.assertEqual(mocked_create.call_count, 1)
             file_name = mocked_create.call_args[0][2]
-            self.assertEqual(file_name, "folder_name(1).pdf")
+            self.assertEqual(file_name, "folder_name(2).pdf")
+        query = parent.repository.query.call_args[0][0]
+        self.assertIn("IN_FOLDER('parent_id')", query)
+        self.assertIn("cmis:name LIKE 'folder\\_name(%).pdf'", query)
 
     @mute_logger("odoo.addons.base.models.assetsbundle")
     def test_use_existing_handler(self):
         self.report.cmis_duplicate_handler = "use_existing"
-        with mock.patch.object(
-            self.report.__class__, "_get_cmis_parent_folder"
-        ) as mocked_cmis_parent, mock.patch.object(
-            self.report.__class__, "_create_cmis_document"
-        ), mock.patch.object(
-            self.report.__class__, "_retrieve_cmis_attachment"
-        ) as mocked_retrieve_cmis_attachment, self.env.cr.savepoint():
-            cmis_parent_folder = mock.MagicMock()
-            mocked_cmis_parent.return_value = cmis_parent_folder
-            rp = mock.MagicMock()
-            cmis_parent_folder.repository = rp
-            rs = mock.MagicMock()
-            rp.query.return_value = rs
-            rs.getNumItems.return_value = 1
-            rs = mock.MagicMock()
-            cmis_parent_folder.getChildren.return_value = rs
-            rs.getNumItems.return_value = 1
+        self._mock_cmis(existing=mock.MagicMock())
+        with (
+            mock.patch.object(
+                self.report.__class__, "_create_cmis_document"
+            ) as mocked_create,
+            mock.patch.object(
+                self.report.__class__, "_retrieve_cmis_attachment"
+            ) as mocked_retrieve_cmis_attachment,
+        ):
             mocked_retrieve_cmis_attachment.return_value = self.env[
                 "ir.attachment"
-            ].new(
-                {
-                    "mimetype": "plain/text",
-                    "raw": self.pdf_content_2,
-                }
-            )
-            self.mocked_merge_pdfs.side_effect = lambda a: a[0].getvalue()
-            # test the call the the create method inside our custom parser
+            ].new({"mimetype": "application/pdf", "raw": self.pdf_content_2})
             res = self.action_report._render(self.report, self.inst.ids)
             self.assertEqual(res[0], self.pdf_content_2)
+            self.assertEqual(mocked_create.call_count, 0)
+
+    def test_parent_folder_backend(self):
+        # the folder is the initial directory of the backend, and its sub
+        # directories when the file name contains a path
+        backend = self.cmis_backend
+        self.report.write(
+            {"cmis_parent_type": "backend", "cmis_backend_id": backend.id}
+        )
+        root = mock.MagicMock(id="root_id")
+        with mock.patch.object(
+            backend.__class__, "get_folder_by_path", return_value=root
+        ) as mocked_get_folder:
+            folder = self.report._get_cmis_parent_folder(self.inst, "sub/report.pdf")
+        self.assertEqual(folder, root)
+        self.assertEqual(
+            mocked_get_folder.call_args_list,
+            [
+                mock.call("/odoo", create_if_not_found=True),
+                mock.call(
+                    "sub", create_if_not_found=True, cmis_parent_objectid="root_id"
+                ),
+            ],
+        )

@@ -10,3 +10,4 @@ Contributors
 ------------
 
 * Laurent Mignon <laurent.mignon@acsone.eu>
+* tansadio <tansadio@gmail.com>

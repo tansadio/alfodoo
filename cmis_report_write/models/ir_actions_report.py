@@ -1,24 +1,22 @@
 # Copyright 2019 ACSONE SA/NV
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
-import base64
 import logging
 import mimetypes
 import os
+import re
 from collections import namedtuple
 from contextlib import contextmanager
 
-from odoo import _, api, fields, models
+from odoo import api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.tools import safe_eval
-from odoo.tools.safe_eval import time
+from odoo.tools.safe_eval import safe_eval, time
 
 _logger = logging.getLogger(__name__)
 
-SAVE_IN_CMIS_MARKER = "'{}'".format(id(object()))
+SAVE_IN_CMIS_MARKER = f"'{id(object())}'"
 
 
 class IrActionsReport(models.Model):
-
     _inherit = "ir.actions.report"
 
     cmis_filename = fields.Char(
@@ -36,14 +34,8 @@ class IrActionsReport(models.Model):
     )
     cmis_parent_type = fields.Selection(
         selection=[
-            (
-                "backend",
-                _("Store as child of the directory defined on the " "backend"),
-            ),
-            (
-                "folder_field",
-                _("Store as child of the folder on the related " "model"),
-            ),
+            ("backend", "Store as child of the directory defined on the backend"),
+            ("folder_field", "Store as child of the folder on the related model"),
         ],
         default="backend",
     )
@@ -55,15 +47,14 @@ class IrActionsReport(models.Model):
     cmis_folder_field_id = fields.Many2one(
         comodel_name="ir.model.fields",
         string="Save generated report into",
-        help="""If empty, deadline will be computed
-                from the task creation date""",
+        help="The CMIS folder field of the model in which the report is saved",
     )
     cmis_duplicate_handler = fields.Selection(
         selection=[
-            ("use_existing", _("Use existing")),
-            ("error", _("Raise exception")),
-            ("new_version", _("Create a new version")),
-            ("increment", _("Rename as file(X).pdf")),
+            ("use_existing", "Use existing"),
+            ("error", "Raise exception"),
+            ("new_version", "Create a new version"),
+            ("increment", "Rename as file(X).pdf"),
         ],
         string="Strategy in case of duplicate",
         default="error",
@@ -78,7 +69,7 @@ class IrActionsReport(models.Model):
         help="Use this field to put additiannal properties to apply to "
         "content created in CMIS. If used, the text will be interpreted "
         "as a python expression that must return a valid python "
-        "dictionary that will be passed as parameter to the cmislib. "
+        "dictionary of CMIS properties. "
         "The object and time are available as variable into the python "
         "context i.e.:\n"
         "{'cmis:secondaryObjectTypeIds': ['P:cm:titled'], \n "
@@ -105,6 +96,11 @@ class IrActionsReport(models.Model):
         # if the report is flagged with attachment_use. Force the flag
         # to be sure that this method is also called when we want to store
         # files into cmis
+        if self.attachment == SAVE_IN_CMIS_MARKER:
+            # already set by an outer call (_render calls _render_qweb_pdf):
+            # only the outer call restores the initial values
+            yield
+            return
         initial_attachment_use = self.attachment_use
         try:
             if self.cmis_filename and not self.attachment:
@@ -121,7 +117,7 @@ class IrActionsReport(models.Model):
                     }
                 )
 
-    def _render_qweb_pdf(self, report_ref, res_ids, data=None):
+    def _render_qweb_pdf(self, report_ref, res_ids=None, data=None):
         report = self._get_report(report_ref)
         with report.save_in_attachment_if_required():
             return super(
@@ -161,11 +157,13 @@ class IrActionsReport(models.Model):
                 continue
             if rec.cmis_parent_type == "backend" and not rec.cmis_backend_id:
                 raise ValidationError(
-                    _("You must specify a backend to use to store your " "file in CMIS")
+                    self.env._(
+                        "You must specify a backend to use to store your file in CMIS"
+                    )
                 )
             if rec.cmis_parent_type == "folder_field" and not rec.cmis_folder_field_id:
                 raise ValidationError(
-                    _(
+                    self.env._(
                         "You must select the folder field to use to "
                         "store your file in CMIS"
                     )
@@ -190,27 +188,30 @@ class IrActionsReport(models.Model):
         cmis_filename = os.path.basename(cmis_filename)
         # Search into the folder if a doc with the same name already
         # exists
-        cmis_repo = cmis_parent_folder.repository
-        cmis_qry = (
-            "SELECT cmis:objectId FROM cmis:document WHERE "
-            "IN_FOLDER('%s') AND cmis:name='%s'"
-            % (cmis_parent_folder.getObjectId(), cmis_filename)
-        )
-        _logger.debug("Query CMIS with %s", cmis_qry)
-        rs = cmis_repo.query(cmis_qry)
-        num_found_items = rs.getNumItems()
-        if not num_found_items:
+        cmis_document = self._search_cmis_document(cmis_parent_folder, cmis_filename)
+        if not cmis_document:
             return res
         # A doc exists, load the content...
-        cmis_object_id = rs.getResults()[0].getObjectId()
-        cmis_document = cmis_repo.getObject(cmis_object_id)
-        content = cmis_document.getContentStream().read()
         return res.new(
             {
-                "datas": base64.b64encode(content),
+                "raw": cmis_document.get_content(),
                 "mimetype": self.get_mimetype(cmis_filename),
             }
         )
+
+    def _search_cmis_document(self, cmis_parent_folder, file_name):
+        """Return the document named file_name in the folder, or None"""
+        cmis_qry = (
+            "SELECT cmis:objectId FROM cmis:document WHERE "
+            f"IN_FOLDER('{cmis_parent_folder.id}') AND "
+            f"cmis:name='{self._sanitize_query_arg(file_name)}'"
+        )
+        _logger.debug("Query CMIS with %s", cmis_qry)
+        repo = cmis_parent_folder.repository
+        page = repo.query(cmis_qry, max_items=1)
+        if not page.objects:
+            return None
+        return repo.get_object(page.objects[0].id)
 
     def _get_cmis_filename(self, record):
         self.ensure_one()
@@ -229,14 +230,14 @@ class IrActionsReport(models.Model):
             "object": record,
             "time": time,
             "cmis_backend": self._get_backend(record),
-            "_": _,
+            "_": self.env._,
             "user": self.env.user,
             "context": self.env.context,
         }
 
     def _safe_eval(self, source, record):
         self.ensure_one()
-        return safe_eval.safe_eval(source, self._get_eval_context(record))
+        return safe_eval(source, self._get_eval_context(record))
 
     def _save_in_cmis(self, record, buffer):
         self.ensure_one()
@@ -264,12 +265,15 @@ class IrActionsReport(models.Model):
                 field.create_value(record)
                 root_objectId = record[field_name]
         else:
-            root_objectId = self.cmis_backend_id.initial_directory_write
+            # initial_directory_write is a path, not an object id
             cmis_backend = self.cmis_backend_id
+            root_objectId = cmis_backend.get_folder_by_path(
+                cmis_backend.initial_directory_write, create_if_not_found=True
+            ).id
         # the generated name can contains sub directories
         path = os.path.dirname(cmis_filename)
         if not path:
-            return cmis_backend.get_cmis_repository().getObject(root_objectId)
+            return cmis_backend.get_cmis_repository().get_object(root_objectId)
         return cmis_backend.get_folder_by_path(
             path, create_if_not_found=True, cmis_parent_objectid=root_objectId
         )
@@ -280,7 +284,7 @@ class IrActionsReport(models.Model):
 
     @api.model
     def _sanitize_query_arg(self, arg):
-        return arg.replace("'", r"\'")
+        return arg.replace("\\", "\\\\").replace("'", "\\'")
 
     def _create_or_update_cmis_document(
         self, buffer, record, file_name, cmis_parent_folder
@@ -290,34 +294,41 @@ class IrActionsReport(models.Model):
         return the created or update cmis doc
         """
         self.ensure_one()
-        qfile_name = self._sanitize_query_arg(file_name)
-        cmis_qry = (
-            "SELECT cmis:objectId FROM cmis:document WHERE "
-            "IN_FOLDER('%s') AND cmis:name='%s'"
-            % (cmis_parent_folder.getObjectId(), qfile_name)
-        )
-        _logger.debug("Query CMIS with %s", cmis_qry)
-        rs = cmis_parent_folder.repository.query(cmis_qry)
+        existing = self._search_cmis_document(cmis_parent_folder, file_name)
         is_new = False
-        num_found_items = rs.getNumItems()
-        if num_found_items == 0 or self.cmis_duplicate_handler == "increment":
-            if num_found_items > 0:
-                name, ext = os.path.splitext(file_name)
-                testname = name + "(*)" + ext
-                rs = cmis_parent_folder.getChildren(filter="cmis:name=%s" % testname)
-                file_name = name + "(%d)" % rs.getNumItems() + ext
+        if not existing or self.cmis_duplicate_handler == "increment":
+            if existing:
+                file_name = self._get_incremented_name(cmis_parent_folder, file_name)
             doc = self._create_cmis_document(
                 buffer, record, file_name, cmis_parent_folder
             )
             return UniqueDocInfo(doc, is_new)
-        if num_found_items > 0 and self.cmis_duplicate_handler == "new_version":
-            doc = cmis_parent_folder.repository.getObject(
-                rs.getResults()[0].getObjectId()
-            )
-            doc = self._update_cmis_document(buffer, record, file_name, doc)
+        if self.cmis_duplicate_handler == "new_version":
+            doc = self._update_cmis_document(buffer, record, file_name, existing)
             return UniqueDocInfo(doc, is_new)
 
-        raise UserError(_('Document "%s" already exists in CMIS') % (file_name))
+        raise UserError(self.env._('Document "%s" already exists in CMIS', file_name))
+
+    def _get_incremented_name(self, cmis_parent_folder, file_name):
+        """Return file_name suffixed by (X), X being the highest suffix
+        already used in the folder plus 1: file(1).pdf, file(2).pdf..."""
+        name, ext = os.path.splitext(file_name)
+        like = (
+            self._sanitize_query_arg(name).replace("%", "\\%").replace("_", "\\_")
+            + "(%)"
+            + self._sanitize_query_arg(ext).replace("%", "\\%").replace("_", "\\_")
+        )
+        cmis_qry = (
+            "SELECT cmis:name FROM cmis:document WHERE "
+            f"IN_FOLDER('{cmis_parent_folder.id}') AND cmis:name LIKE '{like}'"
+        )
+        pattern = re.compile(re.escape(name) + r"\((\d+)\)" + re.escape(ext) + "$")
+        nums = [0]
+        for doc in cmis_parent_folder.repository.query(cmis_qry).objects:
+            match = pattern.match(doc.name or "")
+            if match:
+                nums.append(int(match.group(1)))
+        return f"{name}({max(nums) + 1}){ext}"
 
     def _create_cmis_document(self, buffer, record, file_name, cmis_parent_folder):
         self.ensure_one()
@@ -326,11 +337,11 @@ class IrActionsReport(models.Model):
             props["cmis:objectTypeId"] = self.cmis_objectTypeId
         props.update(self._get_cmis_properties(record))
         mimetype = self.get_mimetype(file_name)
-        doc = cmis_parent_folder.createDocument(
+        doc = cmis_parent_folder.create_document(
             file_name,
+            buffer.getvalue(),
+            mimetype,
             properties=props,
-            contentFile=buffer,
-            contentType=mimetype,
         )
         return doc
 
@@ -342,13 +353,15 @@ class IrActionsReport(models.Model):
             # no update aspects
             del props["cmis:secondaryObjectTypeIds"]
         mimetype = self.get_mimetype(file_name)
-        cmis_doc = cmis_doc.checkout()
-        cmis_doc = cmis_doc.checkin(
-            checkinComment=_("Generated by Odoo"),
-            contentFile=buffer,
-            contentType=mimetype,
+        pwc = cmis_doc.check_out()
+        cmis_doc = cmis_doc.repository.check_in(
+            pwc.id,
+            buffer.getvalue(),
+            mimetype,
             major=False,
-            properties=props,
+            comment=self.env._("Generated by Odoo"),
+            properties=props or None,
+            filename=file_name,
         )
 
         return cmis_doc

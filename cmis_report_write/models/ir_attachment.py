@@ -7,15 +7,14 @@ from odoo import api, models
 
 
 class IrAttachment(models.Model):
-
     _inherit = "ir.attachment"
 
     @api.model_create_multi
     def create(self, vals_list):
-        if not self._context.get("cmis_report_keys", False):
+        if not self.env.context.get("cmis_report_keys", False):
             return super().create(vals_list)
         new_vals_list = []
-        cmis_report, save_in_cmis_marker = self._context.get("cmis_report_keys")
+        cmis_report, save_in_cmis_marker = self.env.context.get("cmis_report_keys")
         for vals in vals_list:
             if "'{}'".format(vals["name"]) != save_in_cmis_marker:
                 # Case of other attachments created when the pdf is rendered
