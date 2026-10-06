@@ -4,8 +4,8 @@
 from odoo import api, models
 
 
-class IrUiView(models.Model):
-    _inherit = "ir.ui.view"
+class Base(models.AbstractModel):
+    _inherit = "base"
 
     @api.model
     def _get_view_field_attributes(self):

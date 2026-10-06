@@ -179,6 +179,23 @@ class TestCmisFields(common.BaseTestCmis):
         backend_description = descr.get("backend")
         self.assertTrue("backend_error" in backend_description)
 
+    def test_cmis_folder_view_description(self):
+        # the description sent to the web client by get_views includes the
+        # attributes of the cmis_folder fields
+        view = self.env["ir.ui.view"].create(
+            {
+                "name": "cmis.test.model.form",
+                "model": "cmis.test.model",
+                "arch": '<form><field name="name" />'
+                '<field name="cmis_folder" /></form>',
+            }
+        )
+        views = self.env["cmis.test.model"].get_views([(view.id, "form")])
+        descr = views["models"]["cmis.test.model"]["fields"]["cmis_folder"]
+        self.assertEqual(descr["backend"]["id"], self.cmis_backend.id)
+        self.assertTrue(descr["allow_create"])
+        self.assertFalse(descr["allow_delete"])
+
     def test_cmis_folder_copy_false(self):
         # By default the cmis_folder value must not be copied.
         inst1 = self.env["cmis.test.model"].create({"name": "folder_name1"})
